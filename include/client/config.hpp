@@ -20,16 +20,18 @@
 #include <vector>
 #include <atomic>
 
-// Сonstants
+// Константы
 namespace Config {
     static const std::string DATA_DIR = "data";
     static const std::string PIONEERS_FILE = "data/pioneers.json";
+    static const std::string GATES_FILE = "data/gates.txt";
     static const std::string DEFAULT_GATE = "3oncms4bmvcv6jvwgzjvovfuhlx6pdho26lo6jny3ruu3hpgz7belzqd.onion";
     static const std::string DEFAULT_PIONEER = "5krka4isaabbpp7fbs3rqacryhvzxpx2b6sirabhbo73bolfbjs5yrqd.onion";
 }
 
 // Page enum
 enum Page {
+    PAGE_GATE_INPUT,
     PAGE_LOADING,
     PAGE_MAIN,
     PAGE_NEW_POST,

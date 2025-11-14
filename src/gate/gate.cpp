@@ -15,6 +15,23 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+/*
+ * Copyright (C) 2025 Anatoly Nikolaevich
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <winsock2.h>
@@ -41,9 +58,8 @@
 #include <thread>
 #include <chrono>
 #include <mutex>
-#include <fstream>
-#include <sstream>
-#include <algorithm>
+
+#include "utils/tor/tor_launcher.hpp"
 
 using json = nlohmann::json;
 namespace beast = boost::beast;
@@ -62,9 +78,6 @@ std::atomic<bool> server_running{false};
 std::atomic<int> total_requests{0};
 std::string onion_address;
 std::atomic<bool> tor_ready{false};
-
-// Tor process info
-PROCESS_INFORMATION tor_process_info = {};
 
 struct LogEntry {
     std::string timestamp;
@@ -85,237 +98,6 @@ void add_log(const std::string& msg, int type = 0) {
     logs.push_back({std::string(buf), msg, type});
     if (logs.size() > 50) logs.erase(logs.begin());
 }
-
-// ---------------------- Tor Launcher -------------------------
-class SimpleTorLauncher {
-private:
-    fs::path exe_folder_;
-    std::string service_name_;
-    int socks_port_;
-    int local_port_;
-
-    fs::path get_data_dir() const {
-        return exe_folder_ / "data" / service_name_;
-    }
-
-    fs::path get_torrc_path() const {
-        return get_data_dir() / ("torrc_" + service_name_);
-    }
-
-    fs::path get_hidden_dir() const {
-        return get_data_dir() / "hidden_service";
-    }
-
-    fs::path get_tor_data_dir() const {
-        return get_data_dir() / ("tor_data_" + service_name_);
-    }
-
-    fs::path get_log_path() const {
-        return get_data_dir() / "tor.log";
-    }
-
-    void create_directories() {
-        fs::create_directories(get_tor_data_dir());
-        fs::create_directories(get_hidden_dir());
-    }
-
-    void create_torrc() {
-        fs::path torrc_path = get_torrc_path();
-
-        std::ofstream torrc(torrc_path);
-        if (!torrc) {
-            throw std::runtime_error("Failed to create torrc: " + torrc_path.string());
-        }
-
-        torrc << "SocksPort " << socks_port_ << "\n";
-        torrc << "DataDirectory " << get_tor_data_dir().string() << "\n";
-        torrc << "HiddenServiceDir " << get_hidden_dir().string() << "\n";
-        torrc << "HiddenServicePort 80 127.0.0.1:" << local_port_ << "\n";
-        torrc << "Log notice file " << get_log_path().string() << "\n";
-        torrc << "Log notice stdout\n";
-        torrc.close();
-
-        add_log("Created torrc at: " + torrc_path.string(), 0);
-    }
-
-    bool is_process_running() const {
-        if (!tor_process_info.hProcess) return false;
-
-        DWORD exit_code;
-        if (!GetExitCodeProcess(tor_process_info.hProcess, &exit_code)) {
-            return false;
-        }
-        return exit_code == STILL_ACTIVE;
-    }
-
-    std::string read_tor_log() const {
-        fs::path log_path = get_log_path();
-        if (!fs::exists(log_path)) return "";
-
-        std::ifstream log_file(log_path);
-        std::stringstream buffer;
-        buffer << log_file.rdbuf();
-        return buffer.str();
-    }
-
-    void wait_for_tor_bootstrap() {
-        add_log("Waiting for Tor bootstrap...", 0);
-        fs::path log_path = get_log_path();
-
-        for (int i = 0; i < 120; ++i) {  
-            if (!is_process_running()) {
-                std::string log_content = read_tor_log();
-                throw std::runtime_error(
-                    "Tor process died during bootstrap. Log:\n" +
-                    (log_content.length() > 500 ? log_content.substr(log_content.length() - 500) : log_content)
-                );
-            }
-
-            if (fs::exists(log_path)) {
-                std::string log_content = read_tor_log();
-
-                if (log_content.find("Bootstrapped 100%") != std::string::npos) {
-                    add_log("Tor bootstrapped successfully!", 1);
-                    return;
-                }
-
-                if (log_content.find("[err]") != std::string::npos) {
-                    throw std::runtime_error("Tor bootstrap error detected. Check: " + log_path.string());
-                }
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-
-        throw std::runtime_error("Tor bootstrap timeout after 60 seconds");
-    }
-
-    std::string wait_for_hostname() {
-        add_log("Waiting for onion hostname...", 0);
-        fs::path hostname_path = get_hidden_dir() / "hostname";
-
-        for (int i = 0; i < 120; ++i) {  
-            if (!is_process_running()) {
-                throw std::runtime_error("Tor process died while waiting for hostname");
-            }
-
-            if (fs::exists(hostname_path)) {
-                std::ifstream hostfile(hostname_path);
-                std::string hostname;
-                if (hostfile && std::getline(hostfile, hostname)) {
-                   
-                    hostname.erase(
-                        std::remove_if(hostname.begin(), hostname.end(), ::isspace),
-                        hostname.end()
-                    );
-
-                    if (!hostname.empty()) {
-                        add_log("Onion hostname ready: " + hostname, 1);
-                        return hostname;
-                    }
-                }
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-
-        std::string log_content = read_tor_log();
-        throw std::runtime_error(
-            "Hostname not found after 60 seconds. Log:\n" +
-            (log_content.length() > 500 ? log_content.substr(log_content.length() - 500) : log_content)
-        );
-    }
-
-public:
-    SimpleTorLauncher(const fs::path& exe_folder, const std::string& service_name,
-                      int socks_port, int local_port)
-        : exe_folder_(exe_folder), service_name_(service_name),
-          socks_port_(socks_port), local_port_(local_port) {}
-
-    std::string launch() {
-        fs::path tor_path = exe_folder_ / "tor" / "tor.exe";
-
-        if (!fs::exists(tor_path)) {
-            throw std::runtime_error("Tor executable not found: " + tor_path.string());
-        }
-
-        add_log("Found Tor at: " + tor_path.string(), 0);
-
-
-        fs::create_directories(get_data_dir());
-        create_directories();
-        create_torrc();
-
-      
-        STARTUPINFOA si;
-        ZeroMemory(&si, sizeof(si));
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-
-        std::string cmd = "\"" + tor_path.string() + "\" -f \"" + get_torrc_path().string() + "\"";
-        std::vector<char> cmd_buf(cmd.begin(), cmd.end());
-        cmd_buf.push_back('\0');
-
-        add_log("Launching Tor process...", 0);
-        add_log("Command: " + cmd, 0);
-
-        tor_process_info = {};
-        if (!CreateProcessA(
-                nullptr,
-                cmd_buf.data(),
-                nullptr,
-                nullptr,
-                FALSE,
-                CREATE_NO_WINDOW,
-                nullptr,
-                nullptr,
-                &si,
-                &tor_process_info))
-        {
-            DWORD err = GetLastError();
-            LPSTR msgBuf = nullptr;
-            FormatMessageA(
-                FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                (LPSTR)&msgBuf, 0, nullptr);
-
-            std::string errmsg = "Failed to launch Tor. Error " + std::to_string(err);
-            if (msgBuf) {
-                errmsg += ": " + std::string(msgBuf);
-                LocalFree(msgBuf);
-            }
-            throw std::runtime_error(errmsg);
-        }
-
-        add_log("Tor process started (PID: " + std::to_string(tor_process_info.dwProcessId) + ")", 1);
-
-
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-
-        if (!is_process_running()) {
-            throw std::runtime_error("Tor process failed to start properly");
-        }
-
-        wait_for_tor_bootstrap();
-
-        return wait_for_hostname();
-    }
-
-    void stop() {
-        if (tor_process_info.hProcess) {
-            add_log("Stopping Tor process...", 0);
-            TerminateProcess(tor_process_info.hProcess, 0);
-            WaitForSingleObject(tor_process_info.hProcess, 5002);
-
-            CloseHandle(tor_process_info.hProcess);
-            CloseHandle(tor_process_info.hThread);
-
-            tor_process_info = {};
-            add_log("Tor stopped", 1);
-        }
-    }
-};
 
 // ---------------------- Server Logic -------------------------
 std::string getActivePioners() {
@@ -380,14 +162,14 @@ void handle_request(const http::request<http::string_body>& req,
 // ---------------------- UI -------------------------
 Element gate_banner() {
     return vbox({
-        text("╔═════════════════════════════════════════════╗") | color(Color::Magenta) | bold,
+        text("╔═══════════════════════════════════════════╗") | color(Color::Magenta) | bold,
         text("║      ██████╗  █████╗ ████████╗███████╗      ║") | color(Color::MagentaLight) | bold,
         text("║     ██╔════╝ ██╔══██╗╚══██╔══╝██╔════╝      ║") | color(Color::Magenta) | bold,
         text("║     ██║  ███╗███████║   ██║   █████╗        ║") | color(Color::MagentaLight) | bold,
         text("║     ██║   ██║██╔══██║   ██║   ██╔══╝        ║") | color(Color::Magenta) | bold,
         text("║     ╚██████╔╝██║  ██║   ██║   ███████╗      ║") | color(Color::MagentaLight) | bold,
         text("║      ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝      ║") | color(Color::Magenta) | bold,
-        text("╚═════════════════════════════════════════════╝") | color(Color::MagentaLight) | bold,
+        text("╚═══════════════════════════════════════════╝") | color(Color::MagentaLight) | bold,
         hbox({
             text("       TORSPER DISCOVERY GATE ") | color(Color::Magenta) | bold,
             filler(),
@@ -489,20 +271,21 @@ Element logs_box() {
 
 // ---------------------- Main -------------------------
 int main() {
-    SimpleTorLauncher* tor_launcher = nullptr;
-
     try {
         fs::path exe_folder = fs::current_path();
+
         auto screen = ScreenInteractive::Fullscreen();
+        TorConfig config("gate", 9052, 5002);
+        TorLauncher tor_launcher(exe_folder, config);
 
-
+        // Tor launch thread
         std::thread tor_thread([&]() {
             try {
-                tor_launcher = new SimpleTorLauncher(exe_folder, "gate", 9052, 5002);
-                onion_address = tor_launcher->launch();
+                add_log("Launching Tor...", 0);
+                onion_address = tor_launcher.launch();
                 tor_ready = true;
+                add_log("Tor started: " + onion_address, 1);
 
-             
                 while (server_running.load()) {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                 }
@@ -511,6 +294,7 @@ int main() {
             }
         });
 
+        // Server thread
         std::thread server_thread([&]() {
             try {
                 while (!tor_ready.load()) {
@@ -568,7 +352,7 @@ int main() {
                 }) | flex,
                 separator(),
                 hbox({
-                    text("🔑 Press ") | color(Color::White),
+                    text("🔒 Press ") | color(Color::White),
                     text("Q") | color(Color::Red) | bold,
                     text(" to quit") | color(Color::White),
                     filler(),
@@ -587,7 +371,7 @@ int main() {
             return false;
         });
 
-    
+        // UI refresh thread
         std::thread refresh_thread([&]() {
             while (server_running.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -596,13 +380,10 @@ int main() {
         });
 
         screen.Loop(component);
+
+        // Cleanup
         server_running = false;
         add_log("Shutting down...", 0);
-
-        if (tor_launcher) {
-            tor_launcher->stop();
-            delete tor_launcher;
-        }
 
         if (tor_thread.joinable()) tor_thread.join();
         if (server_thread.joinable()) server_thread.join();
@@ -610,10 +391,6 @@ int main() {
 
     } catch (const std::exception& e) {
         std::cerr << "Fatal: " << e.what() << "\n";
-        if (tor_launcher) {
-            tor_launcher->stop();
-            delete tor_launcher;
-        }
         return 1;
     }
 

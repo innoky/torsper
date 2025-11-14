@@ -34,19 +34,15 @@ std::recursive_mutex pioneers_mutex;
 bool ensure_data_dir(std::string data_dir)
 {
     try {
-       
-        // Создаем директорию, если она не существует
         if (!fs::exists(data_dir)) {
             return fs::create_directories(data_dir);
         }
         
-      
         if (!fs::is_directory(data_dir)) {
             std::cerr << "[ERROR] Data path is not a directory: " << data_dir << std::endl;
             return false;
         }
-        
-     
+
         std::string test_file = data_dir + "/write_test.tmp";
         std::ofstream test(test_file);
         if (!test) {
@@ -96,7 +92,7 @@ std::vector<std::string> parse_pioneers_from_string(const std::string& input) {
         size_t q2 = arr.find('"', q1 + 1);
         if (q2 == std::string::npos) break;
         std::string item = arr.substr(q1 + 1, q2 - q1 - 1);
-        // trim
+        
         item.erase(item.begin(), std::find_if(item.begin(), item.end(),
             [](unsigned char ch){ return !std::isspace(ch); }));
         item.erase(std::find_if(item.rbegin(), item.rend(),

@@ -17,10 +17,21 @@
 
 #pragma once
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/component/component.hpp>
 #include <string>
+#include <functional>
 
 using namespace ftxui;
 
 Element cyber_banner();
 Element loading_screen(int progress, int frame);
 Element post_card(const std::string& post, int index);
+Element gate_input_banner();
+
+Component create_gate_input_component(
+    std::string* base64_input,
+    std::string* error_message,
+    std::string* success_message,
+    std::function<void()> on_decode,
+    std::function<void()> on_skip
+);

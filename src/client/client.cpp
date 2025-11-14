@@ -40,6 +40,7 @@
 #include "client/pionniers/pionniers.hpp"
 #include "client/network/network.hpp"
 #include "client/ui/ui.hpp"
+#include "client/utils/gate_parser.hpp"
 #include "utils/base64.hpp"
 #include "utils/tor/tor_launcher.hpp"
 
@@ -55,12 +56,22 @@ std::vector<std::string> pioneers;
 std::string pioneers_source = "default";
 std::atomic<bool> tor_ready{false};
 std::atomic<int> loading_progress{0};
-std::atomic<Page> current_page{PAGE_LOADING};
+std::atomic<Page> current_page{PAGE_GATE_INPUT};
 
 int main(int argc, char* argv[]) {
-    gates.push_back(Config::DEFAULT_GATE);
-    
     try {
+        if (!fs::exists(Config::DATA_DIR)) {
+            fs::create_directory(Config::DATA_DIR);
+        }
+
+        gates = GatesParser::loadFromFile(Config::GATES_FILE);
+        
+        if (gates.empty()) {
+            current_page = PAGE_GATE_INPUT;
+        } else {
+            current_page = PAGE_LOADING;
+        }
+
         if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
             std::cerr << "curl_global_init failed\n";
             return 1;
@@ -105,6 +116,59 @@ int main(int argc, char* argv[]) {
 
         std::this_thread::sleep_for(std::chrono::seconds(10));
 
+        std::string base64_input;
+        std::string gate_error_message;
+        std::string gate_success_message;
+
+        auto gate_input_component = create_gate_input_component(
+            &base64_input,
+            &gate_error_message,
+            &gate_success_message,
+            [&]() {
+                try {
+                    gate_error_message = "";
+                    gate_success_message = "";
+                    
+                    if (base64_input.empty()) {
+                        gate_error_message = "Please enter base64 code";
+                        return;
+                    }
+                    
+                    auto parsed_gates = GatesParser::parseFromBase64(base64_input);
+                    
+                    if (parsed_gates.empty()) {
+                        gate_error_message = "No valid .onion addresses found";
+                        return;
+                    }
+         
+                    GatesParser::saveToFile(parsed_gates, Config::GATES_FILE);
+                    
+                    gates = parsed_gates;
+                    
+                    gate_success_message = "Loaded " + std::to_string(gates.size()) + " gate(s)";
+                    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+                    current_page = PAGE_LOADING;
+                    screen.PostEvent(Event::Custom);
+                    
+                } catch (const std::exception& e) {
+                    gate_error_message = std::string("Error: ") + e.what();
+                }
+            },
+
+            [&]() {
+                gates.clear();
+                gates.push_back(Config::DEFAULT_GATE);
+                
+                try {
+                    GatesParser::saveToFile(gates, Config::GATES_FILE);
+                } catch (...) {}
+                
+                current_page = PAGE_LOADING;
+                screen.PostEvent(Event::Custom);
+            }
+        );
+
         int selected = 0;
         std::string input_text;
         std::string status_msg;
@@ -113,7 +177,7 @@ int main(int argc, char* argv[]) {
 
         auto menu_entries = std::vector<std::string>{
             "📜 View Posts",
-            "✍️  New Post",
+            "✏️  New Post",
             "🔄 Refresh",
             "🌐 Pioneers",
             "🚪 Exit"
@@ -169,16 +233,23 @@ int main(int argc, char* argv[]) {
 
         auto menu = Menu(&menu_entries, &selected, menu_option);
         auto input_component = Input(&input_text, "Type your anonymous message...");
-        auto main_component = Container::Vertical({menu, input_component});
+        auto main_component = Container::Vertical({menu, input_component, gate_input_component});
 
         int animation_frame = 0;
         auto renderer = Renderer(main_component, [&] {
             animation_frame++;
 
+            // GATE INPUT PAGE
+            if (current_page == PAGE_GATE_INPUT) {
+                return gate_input_component->Render();
+            }
+
+            // LOADING PAGE
             if (current_page == PAGE_LOADING) {
                 return loading_screen(loading_progress.load(), animation_frame) | center;
             }
 
+            // PIONEERS PAGE
             if (current_page == PAGE_PIONEERS) {
                 Elements list;
                 {
@@ -219,6 +290,7 @@ int main(int argc, char* argv[]) {
                 }) | border;
             }
 
+            // NEW POST PAGE
             if (current_page == PAGE_NEW_POST) {
                 return vbox({
                     cyber_banner(),
@@ -284,11 +356,12 @@ int main(int argc, char* argv[]) {
             }) | border;
         });
 
-        // Key handlers
         renderer |= CatchEvent([&](Event event) {
             if (event == Event::Character('q') || event == Event::Character('Q')) {
-                screen.ExitLoopClosure()();
-                return true;
+                if (current_page != PAGE_GATE_INPUT) {
+                    screen.ExitLoopClosure()();
+                    return true;
+                }
             }
             
             if (current_page == PAGE_PIONEERS) {
@@ -340,6 +413,11 @@ int main(int argc, char* argv[]) {
         });
 
         std::thread loading_thread([&]() {
+            while (current_page.load() == PAGE_GATE_INPUT) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                screen.PostEvent(Event::Custom);
+            }
+
             auto start = std::chrono::steady_clock::now();
 
             while (true) {
