@@ -1,0 +1,52 @@
+
+# IDE / editor
+.vscode/
+*.sln
+*.vcxproj*
+*.vcxproj.filters
+*.vcxproj.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# Build directories and CMake artifacts
+/build/
+ /out/
+ /dist/
+CMakeFiles/
+**/CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+build.ninja
+*.ninja
+cmake-*/*
+
+node_modules/
+venv/
+.env/
+
+*.lock
+*.pid
+*.tmp
+*.temp
+*.cache
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp
+*.swo
+
+# vcpkg / packages
+vcpkg_installed/
+vcpkg/
+packages/
+
+# Ignore root-level binaries (DLL/EXE in repo root)
+/*.dll
+/*.exe
+
+data/

@@ -1,0 +1,350 @@
+/*
+ * Copyright (C) 2025 Anatoly Nikolaevich
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/version.hpp>
+#include <boost/asio/ip/tcp.hpp>
+
+#include <ftxui/screen/screen.hpp>
+#include <ftxui/dom/elements.hpp>
+#include <ftxui/component/component.hpp>
+#include <ftxui/component/screen_interactive.hpp>
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <mutex>
+#include <filesystem>
+#include <atomic>
+#include <thread>
+#include <chrono>
+
+#include "utils/tor/tor_launcher.hpp"
+
+namespace beast = boost::beast;
+namespace http  = beast::http;
+namespace net   = boost::asio;
+using tcp       = net::ip::tcp;
+namespace fs    = std::filesystem;
+using namespace ftxui;
+
+// ---------------------- Data -------------------------
+std::vector<std::string> posts;
+std::mutex posts_mtx;
+
+std::atomic<bool> server_running{false};
+std::atomic<int> total_requests{0};
+std::atomic<int> get_requests{0};
+std::atomic<int> post_requests{0};
+std::string onion_address;
+std::atomic<bool> tor_ready{false};
+
+struct LogEntry {
+    std::string timestamp;
+    std::string message;
+    int type; // 0=info, 1=success, 2=error
+};
+
+std::vector<LogEntry> logs;
+std::mutex logs_mtx;
+
+void add_log(const std::string& msg, int type = 0) {
+    std::lock_guard<std::mutex> lk(logs_mtx);
+    auto now = std::chrono::system_clock::now();
+    auto time = std::chrono::system_clock::to_time_t(now);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", std::localtime(&time));
+
+    logs.push_back({std::string(buf), msg, type});
+    if (logs.size() > 50) logs.erase(logs.begin());
+}
+
+// ---------------------- Server Logic -------------------------
+std::string posts_to_text() {
+    std::lock_guard<std::mutex> lk(posts_mtx);
+    std::string result;
+    for (const auto& post : posts) {
+        result += post + "\n---END---\n";
+    }
+    return result;
+}
+
+
+void handle_request(const http::request<http::string_body>& req,
+                    http::response<http::string_body>& res)
+{
+    total_requests++;
+
+    if (req.method() == http::verb::get && req.target() == "/get_posts") {
+        get_requests++;
+        add_log("GET /get_posts", 1);
+        res.result(http::status::ok);
+        res.set(http::field::content_type, "text/plain");
+        res.body() = posts_to_text();
+        res.prepare_payload();
+        return;
+    }
+    if (req.method() == http::verb::post && req.target() == "/add_post") {
+        post_requests++;
+        add_log("POST /add_post - New post added", 1);
+        {
+            std::lock_guard<std::mutex> lk(posts_mtx);
+            posts.push_back(req.body());
+        }
+        res.result(http::status::created);
+        res.set(http::field::content_type, "text/plain");
+        res.body() = "OK\n";
+        res.prepare_payload();
+        return;
+    }
+
+    add_log("404: " + std::string(req.target()), 2);
+    res.result(http::status::not_found);
+    res.set(http::field::content_type, "text/plain");
+    res.body() = "Not found\n";
+    res.prepare_payload();
+}
+
+// ---------------------- UI -------------------------
+Element server_banner() {
+    return vbox({
+        text("╔════════════════════════════════════════════════════════════════════╗") | color(Color::Cyan) | bold,
+        text("║   ██████╗ ██╗  ██████╗ ███╗   ██╗ ███╗   ██╗ ██╗ ███████╗██████╗   ║") | color(Color::CyanLight) | bold,
+        text("║   ██╔══██╗██║ ██╔═══██╗████╗  ██║ ████╗  ██║ ██║ ██╔════╝██╔══██╗  ║") | color(Color::Cyan) | bold,
+        text("║   ██████╔╝██║ ██║   ██║██╔██╗ ██║ ██╔██╗ ██║ ██║ █████╗  ██████╔╝  ║") | color(Color::CyanLight) | bold,
+        text("║   ██╔═══╝ ██║ ██║   ██║██║╚██╗██║ ██║╚██╗██║ ██║ ██╔══╝  ██╔══██╗  ║") | color(Color::Cyan) | bold,
+        text("║   ██║     ██║ ╚██████╔╝██║ ╚████║ ██║ ╚████║ ██║ ███████╗██║  ██║  ║") | color(Color::CyanLight) | bold,
+        text("║   ╚═╝     ╚═╝  ╚═════╝ ╚═╝  ╚═══╝ ╚═╝  ╚═══╝ ╚═╝ ╚══════╝╚═╝  ╚═╝  ║") | color(Color::Cyan) | bold,
+        text("╚════════════════════════════════════════════════════════════════════╝") | color(Color::CyanLight) | bold,
+        hbox({
+            text("       PIONER SERVER ") | color(Color::Cyan) | bold,
+            filler(),
+            text("v1.0") | color(Color::CyanLight) | dim
+        })
+    }) | center | border;
+}
+
+
+Element stats_box() {
+    return vbox({
+        text("📊 STATISTICS") | color(Color::Yellow) | bold | center,
+        separator(),
+        hbox({
+            text("Total Requests: ") | color(Color::White),
+            text(std::to_string(total_requests.load())) | color(Color::GreenLight) | bold
+        }),
+        hbox({
+            text("GET Requests:   ") | color(Color::White),
+            text(std::to_string(get_requests.load())) | color(Color::Cyan) | bold
+        }),
+        hbox({
+            text("POST Requests:  ") | color(Color::White),
+            text(std::to_string(post_requests.load())) | color(Color::Magenta) | bold
+        }),
+        hbox({
+            text("Stored Posts:   ") | color(Color::White),
+            text(std::to_string(posts.size())) | color(Color::Yellow) | bold
+        })
+    }) | border | size(WIDTH, EQUAL, 40);
+}
+
+Element status_box() {
+    Color status_color = server_running.load() ? Color::GreenLight : Color::Red;
+    std::string status_text = server_running.load() ? "● ONLINE" : "● OFFLINE";
+
+    return vbox({
+        text("🔧 STATUS") | color(Color::Yellow) | bold | center,
+        separator(),
+        hbox({
+            text("Server: ") | color(Color::White),
+            text(status_text) | color(status_color) | bold
+        }),
+        hbox({
+            text("Port: ") | color(Color::White),
+            text("5001") | color(Color::Cyan) | bold
+        }),
+        text(""),
+        text("🌐 Onion Address:") | color(Color::Yellow) | bold,
+        text(onion_address.empty() ? "Initializing..." : onion_address) | color(Color::GreenLight) | dim,
+        text(""),
+        text("Endpoints:") | color(Color::White) | bold,
+        text("  GET  /get_posts") | color(Color::Cyan),
+        text("  POST /add_post") | color(Color::Magenta)
+    }) | border | flex;
+}
+
+Element logs_box() {
+    Elements log_elements;
+    {
+        std::lock_guard<std::mutex> lk(logs_mtx);
+        if (logs.empty()) {
+            log_elements.push_back(text("No logs yet...") | color(Color::GrayDark) | center);
+        } else {
+            for (auto it = logs.rbegin(); it != logs.rend(); ++it) {
+                Color c = it->type == 1 ? Color::GreenLight :
+                         (it->type == 2 ? Color::Red : Color::White);
+                log_elements.push_back(
+                    hbox({
+                        text("[" + it->timestamp + "] ") | color(Color::GrayLight),
+                        text(it->message) | color(c)
+                    })
+                );
+            }
+        }
+    }
+
+    return vbox({
+        text("📝 LOGS") | color(Color::Yellow) | bold | center,
+        separator(),
+        vbox(log_elements) | vscroll_indicator | frame | flex
+    }) | border | flex;
+}
+
+// ---------------------- Main -------------------------
+int main() {
+    try {
+        fs::path exe_folder = fs::current_path();
+
+        auto screen = ScreenInteractive::Fullscreen();
+        TorConfig config("server", 9051, 5001);
+        TorLauncher tor_launcher(exe_folder, config);
+
+        // Tor launch thread
+        std::thread tor_thread([&]() {
+            try {
+
+                add_log("Launching Tor...", 0);
+                onion_address = tor_launcher.launch();
+                tor_ready = true;
+                add_log("Tor started: " + onion_address, 1);
+
+                while (server_running.load()) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+            } catch (const std::exception& e) {
+                add_log(std::string("Tor error: ") + e.what(), 2);
+            }
+        });
+
+        // Server thread
+        std::thread server_thread([&]() {
+            try {
+                while (!tor_ready.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+
+                add_log("Starting HTTP server on 127.0.0.1:5001", 0);
+                net::io_context ioc{1};
+                tcp::acceptor acceptor{ioc, {tcp::v4(), 5001}};
+                server_running = true;
+                add_log("Server ready to accept connections", 1);
+                screen.PostEvent(Event::Custom);
+
+                while (server_running.load()) {
+                    tcp::socket socket{ioc};
+                    acceptor.accept(socket);
+
+                    beast::flat_buffer buffer;
+                    http::request<http::string_body> req;
+                    http::read(socket, buffer, req);
+
+                    http::response<http::string_body> res;
+                    res.version(req.version());
+                    res.keep_alive(false);
+
+                    handle_request(req, res);
+                    http::write(socket, res);
+
+                    beast::error_code ec;
+                    socket.shutdown(tcp::socket::shutdown_send, ec);
+
+                    screen.PostEvent(Event::Custom);
+                }
+            } catch (const std::exception& e) {
+                add_log(std::string("Server error: ") + e.what(), 2);
+            }
+        });
+
+        int animation_frame = 0;
+        auto component = Renderer([&] {
+            animation_frame++;
+
+            return vbox({
+                server_banner(),
+                separator(),
+                hbox({
+                    vbox({
+                        status_box(),
+                        text("") | size(HEIGHT, EQUAL, 1),
+                        stats_box()
+                    }) | size(WIDTH, EQUAL, 42),
+                    separator(),
+                    logs_box()
+                }) | flex,
+                separator(),
+                hbox({
+                    text("🔑 Press ") | color(Color::White),
+                    text("Q") | color(Color::Red) | bold,
+                    text(" to quit") | color(Color::White),
+                    filler(),
+                    text(server_running.load() ? "⚡ RUNNING" : "⏸ STOPPED") |
+                        color(server_running.load() ? Color::GreenLight : Color::Red) | bold
+                })
+            }) | border;
+        });
+
+        component |= CatchEvent([&](Event event) {
+            if (event == Event::Character('q') || event == Event::Character('Q')) {
+                server_running = false;
+                screen.ExitLoopClosure()();
+                return true;
+            }
+            return false;
+        });
+
+        // UI refresh thread
+        std::thread refresh_thread([&]() {
+            while (server_running.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                screen.PostEvent(Event::Custom);
+            }
+        });
+
+        screen.Loop(component);
+
+        // Cleanup
+        server_running = false;
+        add_log("Shutting down...", 0);
+
+        if (tor_thread.joinable()) tor_thread.join();
+        if (server_thread.joinable()) server_thread.join();
+        if (refresh_thread.joinable()) refresh_thread.join();
+
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
